@@ -1,135 +1,75 @@
-use borsh::{BorshDeserialize, BorshSerialize};
-use solana_program::{
-    account_info::{next_account_info, AccountInfo},
-    entrypoint,
-    entrypoint::ProgramResult,
-    msg,
-    pubkey::Pubkey,
+use {
+    solana_program::{
+        account_info::{next_account_info, AccountInfo},
+        entrypoint::ProgramResult,
+        msg,
+        program::invoke_signed,
+        program_error::ProgramError,
+        program_pack::Pack,
+        pubkey::Pubkey,
+    },
+    spl_token::{
+        instruction::transfer_checked,
+        state::{Account, Mint},
+    },
 };
 
-use crate::instructions::CounterInstructions;
 
-pub mod instructions;
 
-#[derive(Debug, BorshDeserialize, BorshSerialize)]
-pub struct CounterAccount {
-    pub counter: u32,
-}
-
-entrypoint!(process_instruction);
-
+solana_program::entrypoint!(process_instruction);
 pub fn process_instruction(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
-    instructions_data: &[u8],
+    _instruction_data: &[u8],
 ) -> ProgramResult {
-    msg!("Counter program entry point");
+    // Create an iterator to safely reference accounts in the slice
+    let account_info_iter = &mut accounts.iter();
 
-    let instruction: CounterInstructions = CounterInstructions::unpack(instructions_data)?;
+    // As part of the program specification the instruction gives:
+    let source_info = next_account_info(account_info_iter)?; // 1.
+    let mint_info = next_account_info(account_info_iter)?; // 2.
+    let destination_info = next_account_info(account_info_iter)?; // 3.
+    let authority_info = next_account_info(account_info_iter)?; // 4.
+    let token_program_info = next_account_info(account_info_iter)?; // 5.
 
-    let accounts_iter = &mut accounts.iter();
-    let account = next_account_info(accounts_iter)?;
-
-    let mut counter_account = CounterAccount::try_from_slice(&account.data.borrow())?;
-
-    match instruction {
-        CounterInstructions::Increment(args) => {
-            counter_account.counter += args.value;
-        }
-        CounterInstructions::Decrement(args) => {
-
-            if counter_account.counter-args.value<0 {
-                counter_account.counter=0;
-            }else{
-                counter_account.counter -= args.value;
-            }
-        }
-        CounterInstructions::Reset => {
-            counter_account.counter = 0;
-        }
-        CounterInstructions::Update(args) => {
-            counter_account.counter = args.value;
-        }
+    // In order to transfer from the source account, owned by the program-derived
+    // address, we must have the correct address and seeds.
+    let (expected_authority, bump_seed) = Pubkey::find_program_address(&[b"authority"], program_id);
+    if expected_authority != *authority_info.key {
+        return Err(ProgramError::InvalidSeeds);
     }
 
-    counter_account.serialize(&mut &mut account.data.borrow_mut()[..])?;
-    Ok(())
-}
+    // The program transfers everything out of its account, so extract that from
+    // the account data.
+    let source_account = Account::unpack(&source_info.try_borrow_data()?)?;
+    let amount =  5000;//source_account.amount;
 
+    // The program uses `transfer_checked`, which requires the number of decimals
+    // in the mint, so extract that from the account data too.
+    let mint = Mint::unpack(&mint_info.try_borrow_data()?)?;
+    let decimals = mint.decimals;
 
-#[cfg(test)]
-mod test {
-    use super::*;
-    use solana_program::{clock::Epoch, pubkey::Pubkey};
-    use std::mem;
-
-    #[test]
-    fn test_counter() {
-        let program_id = Pubkey::default();
-        let key = Pubkey::default();
-        let mut lamports = 0;
-        let mut data = vec![0; mem::size_of::<u32>()];
-        let owner = Pubkey::default();
-
-        let account = AccountInfo::new(
-            &key,
-            false,
-            true,
-            &mut lamports,
-            &mut data,
-            &owner,
-            false,
-            Epoch::default(),
-        );
-
-        let accounts = vec![account];
-
-        let mut increment_instruction_data: Vec<u8> = vec![0];
-        let mut decrement_instruction_data: Vec<u8> = vec![1];
-        let mut update_instruction_data: Vec<u8> = vec![2];
-        let reset_instruction_data: Vec<u8> = vec![3];
-
-        let add_value = 30u32;
-        increment_instruction_data.extend_from_slice(&add_value.to_le_bytes());
-        process_instruction(&program_id, &accounts, &increment_instruction_data).unwrap();
-
-        assert_eq!(
-            CounterAccount::try_from_slice(&accounts[0].data.borrow())
-                .unwrap()
-                .counter,
-            30
-        );
-
-        let decrease_value = 30u32;
-        decrement_instruction_data.extend_from_slice(&decrease_value.to_le_bytes());
-        process_instruction(&program_id, &accounts, &decrement_instruction_data).unwrap();
-
-        assert_eq!(
-            CounterAccount::try_from_slice(&accounts[0].data.borrow())
-                .unwrap()
-                .counter,
-            0
-        );
-
-        let update_value = 33u32;
-        update_instruction_data.extend_from_slice(&update_value.to_le_bytes());
-
-        process_instruction(&program_id, &accounts, &update_instruction_data).unwrap();
-
-        assert_eq!(
-            CounterAccount::try_from_slice(&accounts[0].data.borrow())
-                .unwrap()
-                .counter,
-            33
-        );
-
-        process_instruction(&program_id, &accounts, &reset_instruction_data).unwrap();
-
-        assert_eq!(
-            CounterAccount::try_from_slice(&accounts[0].data.borrow())
-                .unwrap()
-                .counter,
-            0
-        );
-    }
+    // Invoke the transfer
+    msg!("Attempting to transfer {} tokens", amount);
+    invoke_signed(
+        &transfer_checked(
+            token_program_info.key,
+            source_info.key,
+            mint_info.key,
+            destination_info.key,
+            authority_info.key,
+            &[], // no multisig allowed
+            amount,
+            decimals,
+        )
+            .unwrap(),
+        &[
+            source_info.clone(),
+            mint_info.clone(),
+            destination_info.clone(),
+            authority_info.clone(),
+            token_program_info.clone(), // not required, but better for clarity
+        ],
+        &[&[b"authority", &[bump_seed]]],
+    )
 }
